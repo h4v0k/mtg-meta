@@ -74,3 +74,157 @@ def fetch_goldfish_meta(format_name):
         # Remove navigation links that might be caught
         blacklist = ["Price", "Decks", "Metagame", "Standard", "Modern", "Pioneer", "Legacy", "Pauper"]
         df = df[~df["Deck Name"].isin(blacklist)]
+        return df
+    except Exception as e:
+        st.error(f"Scraper error: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=86400)
+def fetch_top8_events(format_code, days_limit):
+    scraper = get_scraper()
+    url = f"https://www.mtgtop8.com/format?f={format_code}&cp=2"
+    try:
+        res = scraper.get(url, timeout=20)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        events = []
+        
+        rows = soup.select("tr.hover_tr")
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) >= 5:
+                date_str = cols[4].text.strip()
+                try:
+                    ev_date = datetime.strptime(date_str, "%d/%m/%y")
+                    if (datetime.now() - ev_date).days > days_limit:
+                        continue
+                except: continue
+
+                link = cols[1].find("a")
+                if link:
+                    events.append({
+                        "Date": date_str,
+                        "Place": cols[2].text.strip(),
+                        "Deck Title": link.text.strip(),
+                        "Link": "https://www.mtgtop8.com/" + link['href']
+                    })
+        return pd.DataFrame(events)
+    except:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=86400)
+def fetch_decklist(url):
+    scraper = get_scraper()
+    try:
+        res = scraper.get(url)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        lines = [l.text.strip() for l in soup.select(".deck_line") if l.text.strip()]
+        return lines
+    except:
+        return []
+
+def get_card_name(line):
+    return re.sub(r'^\d+\s+', '', line).strip()
+
+# --- UI LAYOUT ---
+
+st.title("🛡️ MTG Ultimate Meta Tool")
+
+if "selected_archetype" not in st.session_state:
+    st.session_state.selected_archetype = None
+
+with st.sidebar:
+    st.header("Global Filters")
+    fmt = st.selectbox("Format", list(FORMAT_MAP.keys()))
+    days = st.radio("Search Window", [3, 7, 30], index=1)
+    
+    st.divider()
+    if st.button("Reset Archetype Filter"):
+        st.session_state.selected_archetype = None
+    if st.button("🔄 Force Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+codes = FORMAT_MAP[fmt]
+col1, col2 = st.columns([1, 2])
+
+# --- COLUMN 1: GOLDFISH ---
+with col1:
+    st.subheader("Meta % Breakdown")
+    meta_df = fetch_goldfish_meta(codes['gold'])
+    
+    if not meta_df.empty:
+        st.info("Click a row to filter results.")
+        selection = st.dataframe(
+            meta_df, 
+            on_select="rerun", selection_mode="single-row",
+            hide_index=True, use_container_width=True
+        )
+        
+        if len(selection['selection']['rows']) > 0:
+            idx = selection['selection']['rows'][0]
+            st.session_state.selected_archetype = meta_df.iloc[idx]['Deck Name']
+    else:
+        st.warning("Goldfish is currently blocking or the table is missing. Try 'Force Refresh'.")
+
+# --- COLUMN 2: TOP 8 ---
+with col2:
+    filter_txt = st.session_state.selected_archetype
+    st.subheader(f"Recent {fmt} Results " + (f"[{filter_txt}]" if filter_txt else ""))
+    
+    t8_df = fetch_top8_events(codes['top8'], days)
+    
+    if not t8_df.empty:
+        display_df = t8_df.copy()
+        if filter_txt:
+            # Get first word of archetype (e.g. "Grixis" from "Grixis Midrange")
+            kw = filter_txt.split()[0]
+            display_df = t8_df[t8_df['Deck Title'].str.contains(kw, case=False, na=False)]
+
+        if display_df.empty:
+            st.warning(f"No match for '{filter_txt}'. Showing all.")
+            display_df = t8_df
+
+        event_select = st.dataframe(
+            display_df[['Date', 'Place', 'Deck Title']], 
+            on_select="rerun", selection_mode="single-row",
+            hide_index=True, use_container_width=True
+        )
+
+        if len(event_select['selection']['rows']) > 0:
+            row_idx = event_select['selection']['rows'][0]
+            deck_url = display_df.iloc[row_idx]['Link']
+            
+            # Drill down
+            current_deck = fetch_decklist(deck_url)
+            
+            # Spicy Logic
+            baseline_urls = display_df['Link'].iloc[0:5].tolist()
+            others = [fetch_decklist(u) for u in baseline_urls if u != deck_url]
+            all_common_cards = set()
+            for d in others:
+                for line in d:
+                    all_common_cards.add(get_card_name(line))
+
+            st.divider()
+            st.subheader(f"Decklist: {display_df.iloc[row_idx]['Deck Title']}")
+            
+            # Show Decklist
+            for line in current_deck:
+                card_name = get_card_name(line)
+                is_head = any(h in line for h in ["Sideboard", "Mainboard", "Deck"])
+                if not is_head and card_name not in all_common_cards and len(all_common_cards) > 0:
+                    st.markdown(f":blue[{line}]")
+                else:
+                    st.text(line)
+
+            # Export
+            st.divider()
+            clean_txt = "\n".join(current_deck)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.copy_button("📋 Copy Decklist", clean_txt)
+            with c2:
+                mox_url = f"https://www.moxfield.com/decks/import?decklist={urllib.parse.quote(clean_txt)}"
+                st.link_button("↗️ Export to Moxfield", mox_url)
+    else:
+        st.info("No Top 8 results found.")
