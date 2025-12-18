@@ -140,11 +140,11 @@ if not GITHUB_TOKEN or not REPO_NAME:
 db, current_sha = load_from_github()
 
 with st.sidebar:
-    st.title("Admin")
+    st.title("Admin Controls")
     sel_fmt = st.selectbox("Format", list(FORMAT_MAP.keys()))
     days_to_show = st.radio("Timeframe", [3, 7, 30], index=2)
     
     if st.button("🔄 Sync New Data"):
         with st.spinner("Writing new data to GitHub..."):
             db["meta"][sel_fmt] = scrape_meta(FORMAT_MAP[sel_fmt]['gold'])
-            new_list = scrape_top8_incr
+            # FIXED: Calling the correct f
