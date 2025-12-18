@@ -143,3 +143,19 @@ with col2:
 
             st.divider()
             st.subheader(f"Decklist: {disp_df.iloc[row_idx]['Deck Title']}")
+            
+            for line in target_list:
+                nm = clean_card_name(line)
+                is_h = any(x in line for x in ["Sideboard", "Mainboard", "Deck"])
+                if not is_h and nm not in common_cards and len(common_cards) > 0:
+                    st.markdown(f":blue[{line}]")
+                else:
+                    st.text(line)
+
+            st.divider()
+            txt = "\n".join(target_list)
+            ec1, ec2 = st.columns(2)
+            with ec1: st.copy_button("📋 Copy Decklist", txt)
+            with ec2: st.link_button("↗️ Moxfield", f"https://www.moxfield.com/decks/import?decklist={urllib.parse.quote(txt)}")
+    else:
+        st.info("No results found.")
