@@ -11,7 +11,7 @@ st.set_page_config(page_title="MTG Meta & Spicy Tracker", layout="wide")
 
 # --- SCRAPER ENGINE ---
 def get_scraper():
-    # Chrome 120+ profile to bypass modern Cloudflare checks
+    # Uses a Chrome browser profile to help bypass security blocks
     return cloudscraper.create_scraper(
         browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
     )
@@ -25,7 +25,7 @@ FORMAT_MAP = {
     "Pauper": {"gold": "pauper", "top8": "PAU"}
 }
 
-# --- DATA FETCHING ---
+# --- DATA FETCHING FUNCTIONS ---
 
 @st.cache_data(ttl=86400)
 def fetch_goldfish_meta(format_name):
@@ -36,7 +36,7 @@ def fetch_goldfish_meta(format_name):
         soup = BeautifulSoup(response.text, 'html.parser')
         decks = []
         
-        # Method 1: Target Archetype Tiles
+        # Look for the archetype tiles used on MTGGoldfish
         for tile in soup.select(".archetype-tile"):
             name = tile.select_one(".deck-price-paper a, .archetype-tile-description a")
             meta = tile.select_one(".metagame-percentage-column")
@@ -46,7 +46,7 @@ def fetch_goldfish_meta(format_name):
                     "Meta %": meta.text.strip()
                 })
         
-        # Method 2: Table Fallback
+        # Fallback to table search if tiles are not found
         if not decks:
             table = soup.find("table", class_=re.compile(r'metagame-table'))
             if table:
@@ -58,13 +58,13 @@ def fetch_goldfish_meta(format_name):
                             "Meta %": cols[3].text.strip()
                         })
         return pd.DataFrame(decks)
-    except:
+    except Exception:
         return pd.DataFrame()
 
 @st.cache_data(ttl=86400)
 def fetch_top8_events(format_code, days_limit):
     scraper = get_scraper()
-    # cp=2 pulls last 2 months of data
+    # cp=2 pulls data from the last 2 months for filtering
     url = f"https://www.mtgtop8.com/format?f={format_code}&cp=2"
     try:
         response = scraper.get(url, timeout=20)
@@ -79,7 +79,7 @@ def fetch_top8_events(format_code, days_limit):
                     ev_date = datetime.strptime(date_str, "%d/%m/%y")
                     if (datetime.now() - ev_date).days > days_limit:
                         continue
-                except:
+                except Exception:
                     continue
                 
                 link = cols[1].find("a")
@@ -91,7 +91,7 @@ def fetch_top8_events(format_code, days_limit):
                         "Link": "https://www.mtgtop8.com/" + link['href']
                     })
         return pd.DataFrame(events)
-    except:
+    except Exception:
         return pd.DataFrame()
 
 @st.cache_data(ttl=86400)
@@ -100,21 +100,21 @@ def fetch_decklist(url):
     try:
         res = scraper.get(url, timeout=15)
         soup = BeautifulSoup(res.text, 'html.parser')
-        # MTGTop8 lines contain quantity + card name
-        lines = [l.text.strip() for l in soup.select(".deck_line") if l.text.strip()]
+        # MTGTop8 card lines typically contain quantity and name
+        lines = [line.text.strip() for line in soup.select(".deck_line") if line.text.strip()]
         return lines
-    except:
+    except Exception:
         return []
 
 def get_card_name(line):
-    # Regex to extract 'Fable of the Mirror-Breaker' from '4 Fable of the Mirror-Breaker'
+    # Extracts the card name by stripping leading numbers (e.g., '4 Grief' -> 'Grief')
     return re.sub(r'^\d+\s+', '', line).strip()
 
-# --- UI LOGIC ---
+# --- APP INTERFACE ---
 
-st.title("🧙‍♂️ MTG Metagame & Unique Tech Tracker")
+st.title("🧙‍♂️ MTG Metagame & Spicy Tech Tracker")
 
-# Session state to handle drill-down filtering
+# Use session state to manage filtering across reruns
 if "filter_archetype" not in st.session_state:
     st.session_state.filter_archetype = None
 
@@ -132,4 +132,55 @@ with st.sidebar:
         st.rerun()
 
 codes = FORMAT_MAP[selected_format]
-col1, col2 = st.colum
+main_col1, main_col2 = st.columns([1, 2])
+
+# --- COLUMN 1: METAGAME BREAKDOWN ---
+with main_col1:
+    st.subheader("Meta Breakdown")
+    meta_df = fetch_goldfish_meta(codes['gold'])
+    
+    if not meta_df.empty:
+        st.info("Click a row to filter the Top 8 results list.")
+        # Meta selection table
+        meta_select = st.dataframe(
+            meta_df, 
+            on_select="rerun", 
+            selection_mode="single-row",
+            hide_index=True, 
+            use_container_width=True
+        )
+        
+        if len(meta_select['selection']['rows']) > 0:
+            idx = meta_select['selection']['rows'][0]
+            st.session_state.filter_archetype = meta_df.iloc[idx]['Deck Name']
+    else:
+        st.warning("Could not retrieve metagame data from MTGGoldfish.")
+
+# --- COLUMN 2: TOP 8 EVENTS ---
+with main_col2:
+    current_filter = st.session_state.filter_archetype
+    st.subheader(f"Recent {selected_format} Results" + (f" ({current_filter})" if current_filter else ""))
+    
+    t8_df = fetch_top8_events(codes['top8'], days_val)
+    
+    if not t8_df.empty:
+        display_df = t8_df.copy()
+        # Filter Top 8 results if an archetype was selected in Column 1
+        if current_filter:
+            keyword = current_filter.split()[0]
+            display_df = t8_df[t8_df['Deck Title'].str.contains(keyword, case=False, na=False)]
+        
+        if display_df.empty and current_filter:
+            st.warning(f"No results for '{current_filter}'. Showing all entries.")
+            display_df = t8_df
+
+        event_select = st.dataframe(
+            display_df[['Date', 'Place', 'Deck Title']], 
+            on_select="rerun", 
+            selection_mode="single-row",
+            hide_index=True, 
+            use_container_width=True
+        )
+
+        # --- DECKLIST DRILL-DOWN ---
+        if len(event_select['select
