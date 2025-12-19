@@ -10,9 +10,8 @@ import requests
 import base64
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="MTG Meta Tracker", layout="wide")
+st.set_page_config(page_title="MTG Cloud Meta Tracker", layout="wide")
 
-# Safe Secret Retrieval
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", None)
 REPO_NAME = st.secrets.get("REPO_NAME", None)
 DB_FILE = "database.json"
@@ -28,7 +27,7 @@ FORMAT_MAP = {
 def get_scraper():
     return cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
 
-# --- GITHUB PERSISTENCE ---
+# --- GITHUB DATA PERSISTENCE ---
 
 def load_from_github():
     if not GITHUB_TOKEN or not REPO_NAME:
@@ -41,11 +40,11 @@ def load_from_github():
             data = res.json()
             content = base64.b64decode(data['content']).decode('utf-8')
             db = json.loads(content)
-            if "meta" not in db: db["meta"] = {}
-            if "decks" not in db: db["decks"] = []
             return db, data['sha']
-    except Exception:
-        pass
+        else:
+            st.sidebar.error(f"GitHub Load Error: {res.status_code}")
+    except Exception as e:
+        st.sidebar.error(f"GitHub Load Exception: {e}")
     return {"meta": {}, "decks": []}, None
 
 def save_to_github(data, sha):
@@ -61,11 +60,16 @@ def save_to_github(data, sha):
     
     content_encoded = base64.b64encode(json.dumps(data, indent=2).encode('utf-8')).decode('utf-8')
     payload = {
-        "message": "Update MTG Database",
+        "message": f"Update MTG Data {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "content": content_encoded,
         "sha": sha
     }
-    requests.put(url, headers=headers, json=payload)
+    res = requests.put(url, headers=headers, json=payload)
+    if res.status_code in [200, 201]:
+        return True
+    else:
+        st.error(f"GitHub Save Error: {res.status_code} - {res.text}")
+        return False
 
 # --- SCRAPING ENGINE ---
 
@@ -74,6 +78,10 @@ def scrape_meta(fmt_name):
     url = f"https://www.mtggoldfish.com/metagame/{fmt_name}/full#paper"
     try:
         res = scraper.get(url, timeout=20)
+        if res.status_code != 200:
+            st.warning(f"MTGGoldfish returned status {res.status_code} (Likely Blocked)")
+            return []
+        
         soup = BeautifulSoup(res.text, 'html.parser')
         decks = []
         for row in soup.find_all("tr"):
@@ -84,11 +92,13 @@ def scrape_meta(fmt_name):
                 if link and len(link.text.strip()) > 2:
                     decks.append({"name": link.text.strip(), "pct": pct_match.group(1)})
         return decks
-    except: return []
+    except Exception as e:
+        st.error(f"Goldfish Scrape Error: {e}")
+        return []
 
 def scrape_top8_incremental(fmt_code, existing_decks):
     scraper = get_scraper()
-    url = f"https://www.mtgtop8.com/format?f={fmt_code}&cp=2"
+    url = f"https://www.mtgtop8.com/format?f={fmt_code}&cp=1"
     
     fmt_decks = [d for d in existing_decks if d['format'] == fmt_code]
     newest_cached = None
@@ -98,6 +108,10 @@ def scrape_top8_incremental(fmt_code, existing_decks):
     new_entries = []
     try:
         res = scraper.get(url, timeout=20)
+        if res.status_code != 200:
+            st.warning(f"MTGTop8 returned status {res.status_code} (Likely Blocked)")
+            return []
+            
         soup = BeautifulSoup(res.text, 'html.parser')
         for row in soup.select("tr.hover_tr"):
             cols = row.find_all("td")
@@ -117,47 +131,38 @@ def scrape_top8_incremental(fmt_code, existing_decks):
                         })
                 except: continue
         return new_entries
-    except: return []
-
-def fetch_decklist(deck_id):
-    scraper = get_scraper()
-    try:
-        res = scraper.get(f"https://www.mtgtop8.com/dec?d={deck_id}", timeout=15)
-        return [l.strip() for l in res.text.splitlines() if l.strip() and not l.startswith("//")]
-    except: return []
-
-def get_card_name(line):
-    return re.sub(r'^\d+\s+', '', line).strip()
+    except Exception as e:
+        st.error(f"MTGTop8 Scrape Error: {e}")
+        return []
 
 # --- MAIN UI ---
 
-# 1. Check for Secrets first
-if not GITHUB_TOKEN or not REPO_NAME:
-    st.error("⚠️ Secrets Missing: Please add GITHUB_TOKEN and REPO_NAME to Streamlit Settings.")
-    st.stop()
-
-# 2. Load DB
 db, current_sha = load_from_github()
 
-# 3. Sidebar UI (Always visible)
 with st.sidebar:
-    st.title("🛡️ MTG Tracker Settings")
+    st.title("🛡️ MTG Tracker Admin")
     sel_fmt = st.selectbox("Format", list(FORMAT_MAP.keys()))
     days_to_show = st.radio("Display window", [3, 7, 30], index=2)
     
     st.divider()
     if st.button("🔄 Sync New Decks (Daily)"):
-        with st.spinner("Writing new lists to GitHub..."):
-            db["meta"][sel_fmt] = scrape_meta(FORMAT_MAP[sel_fmt]['gold'])
+        with st.spinner("Step 1: Scraping Websites..."):
+            scraped_meta = scrape_meta(FORMAT_MAP[sel_fmt]['gold'])
             new_decks = scrape_top8_incremental(FORMAT_MAP[sel_fmt]['top8'], db["decks"])
-            db["decks"].extend(new_decks)
-            # Re-fetch SHA just in case another instance updated it
-            _, latest_sha = load_from_github()
-            save_to_github(db, latest_sha or current_sha)
-            st.success(f"Synced {len(new_decks)} new lists!")
-            st.rerun()
+            
+            if not scraped_meta and not new_decks:
+                st.error("❌ Both websites blocked the scrape. Try again in an hour or run locally.")
+            else:
+                st.write(f"✅ Found {len(scraped_meta)} archetypes and {len(new_decks)} new decks.")
+                with st.spinner("Step 2: Saving to GitHub..."):
+                    db["meta"][sel_fmt] = scraped_meta
+                    db["decks"].extend(new_decks)
+                    success = save_to_github(db, current_sha)
+                    if success:
+                        st.success("🎉 Database Updated Successfully!")
+                        st.rerun()
 
-# 4. Main Body
+# Layout
 col1, col2 = st.columns([1, 2])
 
 with col1:
@@ -166,28 +171,17 @@ with col1:
     selected_archetype = None
     if meta_data:
         m_df = pd.DataFrame(meta_data)
-        # on_select="rerun" ensures we can capture the click
         m_sel = st.dataframe(m_df, on_select="rerun", selection_mode="single-row", hide_index=True, use_container_width=True)
-        
-        # Selection logic (Modern Streamlit style)
         if m_sel.selection.rows:
             selected_archetype = m_df.iloc[m_sel.selection.rows[0]]['name']
     else:
-        st.info("No data cached. Click 'Sync New Decks' in the sidebar to start.")
+        st.info("Database is empty. Please click 'Sync New Decks' in the sidebar.")
 
 with col2:
-    header_text = f"Top Results ({selected_archetype})" if selected_archetype else "Recent Results"
-    st.subheader(header_text)
-    
-    # Filter decks by format and date
+    st.subheader("Recent Results")
     cutoff = datetime.now() - timedelta(days=days_to_show)
-    filtered = [
-        d for d in db["decks"] 
-        if d['format'] == FORMAT_MAP[sel_fmt]['top8'] 
-        and datetime.strptime(d['Date'], "%d/%m/%y") >= cutoff
-    ]
+    filtered = [d for d in db["decks"] if d['format'] == FORMAT_MAP[sel_fmt]['top8'] and datetime.strptime(d['Date'], "%d/%m/%y") >= cutoff]
     
-    # Filter by selected archetype (if any)
     if selected_archetype:
         kw = selected_archetype.split()[0].lower()
         filtered = [d for d in filtered if kw in d['Title'].lower()]
@@ -199,32 +193,21 @@ with col2:
         if e_sel.selection.rows:
             target = filtered[e_sel.selection.rows[0]]
             
-            # Fetch cards if they haven't been downloaded yet
+            # Use MTGTop8 .dec export for list (Cleanest text)
             if "cards" not in target:
-                with st.spinner("Downloading list..."):
-                    target["cards"] = fetch_decklist(target["ID"])
-                    # Save back to DB
+                with st.spinner("Downloading decklist..."):
+                    scraper = get_scraper()
+                    res = scraper.get(f"https://www.mtgtop8.com/dec?d={target['ID']}")
+                    target["cards"] = [l.strip() for l in res.text.splitlines() if l.strip() and not l.startswith("//")]
                     _, latest_sha = load_from_github()
-                    save_to_github(db, latest_sha or current_sha)
-
-            # Spicy Tech Highlighting
-            # Compare cards in this deck against all other cards of the same keyword in our DB
-            keyword = target["Title"].split()[0].lower()
-            pool = [d["cards"] for d in db["decks"] if "cards" in d and keyword in d['Title'].lower() and d["ID"] != target["ID"]]
-            common_cards = {get_card_name(l) for d_list in pool for l in d_list}
+                    save_to_github(db, latest_sha)
 
             st.divider()
-            st.subheader(f"Decklist: {target['Title']}")
-            st.caption("Cards in blue appear in this deck but haven't appeared in other recent versions of this archetype in your database.")
+            st.subheader(target["Title"])
             
-            # UI display of cards
+            # Visual List
             for line in target["cards"]:
-                name = get_card_name(line)
-                # Don't highlight headers
-                if name not in common_cards and len(common_cards) > 0 and not any(h in line for h in ["Sideboard", "//"]):
-                    st.markdown(f":blue[{line}]")
-                else:
-                    st.text(line)
+                st.text(line)
 
             # Actions
             list_txt = "\n".join(target["cards"])
@@ -233,6 +216,6 @@ with col2:
                 st.copy_button("📋 Copy List", list_txt)
             with a2:
                 mox_url = f"https://www.moxfield.com/decks/import?decklist={urllib.parse.quote(list_txt)}"
-                st.link_button("↗️ Export to Moxfield", mox_url)
+                st.link_button("↗️ Moxfield", mox_url)
     else:
-        st.write("No matching decks found for this format/timeframe.")
+        st.write("No matching decks found.")
