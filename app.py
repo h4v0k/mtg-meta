@@ -10,10 +10,11 @@ import requests
 import base64
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="MTG Cloud Meta Tracker", layout="wide")
+st.set_page_config(page_title="MTG Meta Tracker", layout="wide")
 
-GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN")
-REPO_NAME = st.secrets.get("REPO_NAME")
+# Safe Secret Retrieval
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", None)
+REPO_NAME = st.secrets.get("REPO_NAME", None)
 DB_FILE = "database.json"
 
 FORMAT_MAP = {
@@ -27,21 +28,22 @@ FORMAT_MAP = {
 def get_scraper():
     return cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
 
-# --- GITHUB DATA PERSISTENCE ---
+# --- GITHUB PERSISTENCE ---
 
 def load_from_github():
+    if not GITHUB_TOKEN or not REPO_NAME:
+        return {"meta": {}, "decks": []}, None
     url = f"https://api.github.com/repos/{REPO_NAME}/contents/{DB_FILE}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     try:
         res = requests.get(url, headers=headers)
         if res.status_code == 200:
-            json_data = res.json()
-            content = base64.b64decode(json_data['content']).decode('utf-8')
+            data = res.json()
+            content = base64.b64decode(data['content']).decode('utf-8')
             db = json.loads(content)
-            # Ensure keys exist
             if "meta" not in db: db["meta"] = {}
             if "decks" not in db: db["decks"] = []
-            return db, json_data['sha']
+            return db, data['sha']
     except Exception:
         pass
     return {"meta": {}, "decks": []}, None
@@ -50,7 +52,7 @@ def save_to_github(data, sha):
     url = f"https://api.github.com/repos/{REPO_NAME}/contents/{DB_FILE}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     
-    # Keep only the last 30 days of data in the JSON
+    # Prune old data (keep 30 days)
     cutoff = datetime.now() - timedelta(days=30)
     data["decks"] = [
         d for d in data["decks"] 
@@ -65,7 +67,7 @@ def save_to_github(data, sha):
     }
     requests.put(url, headers=headers, json=payload)
 
-# --- SCRAPING LOGIC ---
+# --- SCRAPING ENGINE ---
 
 def scrape_meta(fmt_name):
     scraper = get_scraper()
@@ -82,8 +84,7 @@ def scrape_meta(fmt_name):
                 if link and len(link.text.strip()) > 2:
                     decks.append({"name": link.text.strip(), "pct": pct_match.group(1)})
         return decks
-    except:
-        return []
+    except: return []
 
 def scrape_top8_incremental(fmt_code, existing_decks):
     scraper = get_scraper()
@@ -116,35 +117,122 @@ def scrape_top8_incremental(fmt_code, existing_decks):
                         })
                 except: continue
         return new_entries
-    except:
-        return []
+    except: return []
 
-def fetch_clean_decklist(deck_id):
+def fetch_decklist(deck_id):
     scraper = get_scraper()
     try:
         res = scraper.get(f"https://www.mtgtop8.com/dec?d={deck_id}", timeout=15)
         return [l.strip() for l in res.text.splitlines() if l.strip() and not l.startswith("//")]
-    except:
-        return []
+    except: return []
 
 def get_card_name(line):
     return re.sub(r'^\d+\s+', '', line).strip()
 
-# --- APP UI ---
+# --- MAIN UI ---
 
+# 1. Check for Secrets first
 if not GITHUB_TOKEN or not REPO_NAME:
-    st.error("Missing GitHub Secrets (GITHUB_TOKEN / REPO_NAME)")
+    st.error("⚠️ Secrets Missing: Please add GITHUB_TOKEN and REPO_NAME to Streamlit Settings.")
     st.stop()
 
-# Load DB
+# 2. Load DB
 db, current_sha = load_from_github()
 
+# 3. Sidebar UI (Always visible)
 with st.sidebar:
-    st.title("Admin Controls")
+    st.title("🛡️ MTG Tracker Settings")
     sel_fmt = st.selectbox("Format", list(FORMAT_MAP.keys()))
-    days_to_show = st.radio("Timeframe", [3, 7, 30], index=2)
+    days_to_show = st.radio("Display window", [3, 7, 30], index=2)
     
-    if st.button("🔄 Sync New Data"):
-        with st.spinner("Writing new data to GitHub..."):
+    st.divider()
+    if st.button("🔄 Sync New Decks (Daily)"):
+        with st.spinner("Writing new lists to GitHub..."):
             db["meta"][sel_fmt] = scrape_meta(FORMAT_MAP[sel_fmt]['gold'])
-            # FIXED: Calling the correct f
+            new_decks = scrape_top8_incremental(FORMAT_MAP[sel_fmt]['top8'], db["decks"])
+            db["decks"].extend(new_decks)
+            # Re-fetch SHA just in case another instance updated it
+            _, latest_sha = load_from_github()
+            save_to_github(db, latest_sha or current_sha)
+            st.success(f"Synced {len(new_decks)} new lists!")
+            st.rerun()
+
+# 4. Main Body
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    st.subheader("Metagame %")
+    meta_data = db["meta"].get(sel_fmt, [])
+    selected_archetype = None
+    if meta_data:
+        m_df = pd.DataFrame(meta_data)
+        # on_select="rerun" ensures we can capture the click
+        m_sel = st.dataframe(m_df, on_select="rerun", selection_mode="single-row", hide_index=True, use_container_width=True)
+        
+        # Selection logic (Modern Streamlit style)
+        if m_sel.selection.rows:
+            selected_archetype = m_df.iloc[m_sel.selection.rows[0]]['name']
+    else:
+        st.info("No data cached. Click 'Sync New Decks' in the sidebar to start.")
+
+with col2:
+    header_text = f"Top Results ({selected_archetype})" if selected_archetype else "Recent Results"
+    st.subheader(header_text)
+    
+    # Filter decks by format and date
+    cutoff = datetime.now() - timedelta(days=days_to_show)
+    filtered = [
+        d for d in db["decks"] 
+        if d['format'] == FORMAT_MAP[sel_fmt]['top8'] 
+        and datetime.strptime(d['Date'], "%d/%m/%y") >= cutoff
+    ]
+    
+    # Filter by selected archetype (if any)
+    if selected_archetype:
+        kw = selected_archetype.split()[0].lower()
+        filtered = [d for d in filtered if kw in d['Title'].lower()]
+
+    if filtered:
+        f_df = pd.DataFrame(filtered)
+        e_sel = st.dataframe(f_df[['Date', 'Place', 'Title']], on_select="rerun", selection_mode="single-row", hide_index=True, use_container_width=True)
+
+        if e_sel.selection.rows:
+            target = filtered[e_sel.selection.rows[0]]
+            
+            # Fetch cards if they haven't been downloaded yet
+            if "cards" not in target:
+                with st.spinner("Downloading list..."):
+                    target["cards"] = fetch_decklist(target["ID"])
+                    # Save back to DB
+                    _, latest_sha = load_from_github()
+                    save_to_github(db, latest_sha or current_sha)
+
+            # Spicy Tech Highlighting
+            # Compare cards in this deck against all other cards of the same keyword in our DB
+            keyword = target["Title"].split()[0].lower()
+            pool = [d["cards"] for d in db["decks"] if "cards" in d and keyword in d['Title'].lower() and d["ID"] != target["ID"]]
+            common_cards = {get_card_name(l) for d_list in pool for l in d_list}
+
+            st.divider()
+            st.subheader(f"Decklist: {target['Title']}")
+            st.caption("Cards in blue appear in this deck but haven't appeared in other recent versions of this archetype in your database.")
+            
+            # UI display of cards
+            for line in target["cards"]:
+                name = get_card_name(line)
+                # Don't highlight headers
+                if name not in common_cards and len(common_cards) > 0 and not any(h in line for h in ["Sideboard", "//"]):
+                    st.markdown(f":blue[{line}]")
+                else:
+                    st.text(line)
+
+            # Actions
+            list_txt = "\n".join(target["cards"])
+            a1, a2 = st.columns(2)
+            with a1:
+                st.copy_button("📋 Copy List", list_txt)
+            with a2:
+                mox_url = f"https://www.moxfield.com/decks/import?decklist={urllib.parse.quote(list_txt)}"
+                st.link_button("↗️ Export to Moxfield", mox_url)
+    else:
+        st.write("No matching decks found for this format/timeframe.")
